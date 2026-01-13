@@ -6,11 +6,11 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const app = express();
 const port = process.env.PORT || 3000;
 
-/* ---------------- MIDDLEWARE ---------------- */
+/* ================= MIDDLEWARE ================= */
 app.use(cors());
 app.use(express.json());
 
-/* ---------------- MONGODB CONNECTION ---------------- */
+/* ================= DB CONNECTION ================= */
 const uri = process.env.MONGODB_URI;
 
 const client = new MongoClient(uri, {
@@ -21,10 +21,7 @@ const client = new MongoClient(uri, {
   },
 });
 
-let db;
-let contestsCollection;
-let usersCollection;
-let submissionsCollection;
+let db, contestsCollection, usersCollection, submissionsCollection;
 
 async function connectDB() {
   if (!db) {
@@ -33,145 +30,222 @@ async function connectDB() {
     contestsCollection = db.collection("contests");
     usersCollection = db.collection("users");
     submissionsCollection = db.collection("submissions");
-    console.log("✅ Connected to MongoDB Atlas");
+    console.log("✅ MongoDB Connected");
   }
 }
 
-/* ---------------- HEALTH CHECK ---------------- */
+/* ================= HEALTH ================= */
 app.get("/", async (req, res) => {
   await connectDB();
-  res.send("SkillSpire Contest Server API Running!");
+  res.send("SkillSpire API Running");
 });
 
-/* ---------------- CONTEST ROUTES ---------------- */
+/* =====================================================
+   ===================== CONTESTS ======================
+   ===================================================== */
 
-/**
- * GET /contests
- * Query params:
- *  - search (string)
- *  - sort=participants
- *  - limit=number
- */
+/* Get contests */
 app.get("/contests", async (req, res) => {
   await connectDB();
-
-  const { search, sort, limit } = req.query;
-
+  const { search, sort, limit, creatorEmail, status } = req.query;
   let query = {};
 
-  // 🔍 Search by contest name or type
   if (search) {
-    query = {
-      $or: [
-        { name: { $regex: search, $options: "i" } },
-        { type: { $regex: search, $options: "i" } },
-      ],
-    };
+    query.$or = [
+      { name: { $regex: search, $options: "i" } },
+      { type: { $regex: search, $options: "i" } },
+    ];
   }
 
-  // 🔁 Create cursor
+  if (creatorEmail) query.creatorEmail = creatorEmail;
+  if (status) query.status = status;
+
   let cursor = contestsCollection.find(query);
+  if (sort === "participants") cursor = cursor.sort({ participants: -1 });
+  if (limit) cursor = cursor.limit(Number(limit));
 
-  // 🔥 Sort by highest participants
-  if (sort === "participants") {
-    cursor = cursor.sort({ participants: -1 });
-  }
-
-  // 📌 Limit result count
-  if (limit) {
-    cursor = cursor.limit(parseInt(limit));
-  }
-
-  const contests = await cursor.toArray();
-  res.json(contests);
+  res.json(await cursor.toArray());
 });
 
-/* -------- Get single contest -------- */
+/* Get single contest */
 app.get("/contests/:id", async (req, res) => {
   await connectDB();
+  const contest = await contestsCollection.findOne({
+    _id: new ObjectId(req.params.id),
+  });
+  res.json(contest);
+});
 
+/* Add contest (Creator) */
+app.post("/contests", async (req, res) => {
+  await connectDB();
+  const contest = {
+    ...req.body,
+    participants: 0,
+    status: "pending",
+    createdAt: new Date(),
+  };
+  const result = await contestsCollection.insertOne(contest);
+  res.json(result);
+});
+
+/* Edit contest (only pending) */
+app.put("/contests/:id", async (req, res) => {
+  await connectDB();
   const contest = await contestsCollection.findOne({
     _id: new ObjectId(req.params.id),
   });
 
-  if (!contest) {
-    return res.status(404).json({ error: "Contest not found" });
+  if (contest.status !== "pending") {
+    return res.status(403).json({ message: "Edit not allowed" });
   }
 
-  res.json(contest);
+  const result = await contestsCollection.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: req.body }
+  );
+  res.json(result);
 });
 
-/* -------- Add new contest -------- */
-app.post("/contests", async (req, res) => {
+/* Admin: approve / reject */
+app.patch("/contests/status/:id", async (req, res) => {
   await connectDB();
-
-  const contest = req.body;
-
-  contest.createdAt = new Date();
-  contest.participants = contest.participants || 0;
-  contest.status = "pending";
-
-  const result = await contestsCollection.insertOne(contest);
-  res.json({ insertedId: result.insertedId });
+  const result = await contestsCollection.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: { status: req.body.status } }
+  );
+  res.json(result);
 });
 
-/* -------- Register contest (increase participants) -------- */
+/* Delete contest */
+app.delete("/contests/:id", async (req, res) => {
+  await connectDB();
+  res.json(
+    await contestsCollection.deleteOne({ _id: new ObjectId(req.params.id) })
+  );
+});
+
+/* Join contest */
 app.post("/contests/:id/register", async (req, res) => {
   await connectDB();
 
-  const result = await contestsCollection.updateOne(
+  const { email } = req.body;
+
+  await contestsCollection.updateOne(
     { _id: new ObjectId(req.params.id) },
     { $inc: { participants: 1 } }
   );
 
-  res.json(result);
+  await usersCollection.updateOne(
+    { email },
+    { $addToSet: { participatedContests: req.params.id } }
+  );
+
+  res.json({ success: true });
 });
 
-/* ---------------- USER ROUTES ---------------- */
+/* =====================================================
+   ===================== USERS =========================
+   ===================================================== */
 
-/* -------- Add new user -------- */
+/* Save user */
 app.post("/users", async (req, res) => {
   await connectDB();
-
   const user = req.body;
 
-  const existing = await usersCollection.findOne({ email: user.email });
-  if (existing) {
-    return res.json({ message: "User already exists" });
-  }
+  const exists = await usersCollection.findOne({ email: user.email });
+  if (exists) return res.json({ message: "User exists" });
 
   user.role = "user";
   user.createdAt = new Date();
+  user.participatedContests = [];
+  user.wonContests = [];
 
-  const result = await usersCollection.insertOne(user);
-  res.json({ insertedId: result.insertedId });
+  res.json(await usersCollection.insertOne(user));
 });
 
-/* ---------------- SUBMISSION ROUTES ---------------- */
+/* Get all users (Admin) */
+app.get("/users", async (req, res) => {
+  await connectDB();
+  res.json(await usersCollection.find().toArray());
+});
 
-/* -------- Submit contest entry -------- */
+/* Get role */
+app.get("/users/role/:email", async (req, res) => {
+  await connectDB();
+  const user = await usersCollection.findOne({ email: req.params.email });
+  res.json({ role: user?.role || "user" });
+});
+
+/* Update role (Admin) */
+app.patch("/users/role/:email", async (req, res) => {
+  await connectDB();
+  res.json(
+    await usersCollection.updateOne(
+      { email: req.params.email },
+      { $set: { role: req.body.role } }
+    )
+  );
+});
+
+/* =====================================================
+   =================== SUBMISSIONS =====================
+   ===================================================== */
+
+/* Submit task */
 app.post("/submissions", async (req, res) => {
   await connectDB();
-
-  const submission = req.body;
-  submission.submittedAt = new Date();
-
-  const result = await submissionsCollection.insertOne(submission);
-  res.json({ insertedId: result.insertedId });
+  const submission = {
+    ...req.body,
+    submittedAt: new Date(),
+    isWinner: false,
+  };
+  res.json(await submissionsCollection.insertOne(submission));
 });
 
-/* -------- Get submissions for a contest -------- */
+/* Get submissions by contest */
 app.get("/submissions/:contestId", async (req, res) => {
   await connectDB();
-
-  const submissions = await submissionsCollection
-    .find({ contestId: req.params.contestId })
-    .toArray();
-
-  res.json(submissions);
+  res.json(
+    await submissionsCollection
+      .find({ contestId: req.params.contestId })
+      .toArray()
+  );
 });
 
-/* ---------------- START SERVER ---------------- */
-app.listen(port, () => {
-  console.log(`🚀 SkillSpire Server running at http://localhost:${port}`);
+/* Declare winner (Creator – only one) */
+app.patch("/submissions/winner/:id", async (req, res) => {
+  await connectDB();
+
+  const submission = await submissionsCollection.findOne({
+    _id: new ObjectId(req.params.id),
+  });
+
+  // reset previous winners
+  await submissionsCollection.updateMany(
+    { contestId: submission.contestId },
+    { $set: { isWinner: false } }
+  );
+
+  // set winner
+  await submissionsCollection.updateOne(
+    { _id: new ObjectId(req.params.id) },
+    { $set: { isWinner: true } }
+  );
+
+  // save to user
+  await usersCollection.updateOne(
+    { email: submission.userEmail },
+    { $addToSet: { wonContests: submission.contestId } }
+  );
+
+  res.json({ success: true });
 });
+
+/* =====================================================
+   =================== SERVER ==========================
+   ===================================================== */
+
+app.listen(port, () =>
+  console.log(`🚀 Server running on http://localhost:${port}`)
+);
