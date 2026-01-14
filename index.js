@@ -147,12 +147,17 @@ app.post("/payments", async (req, res) => {
 
   const { contestId, email, amount } = req.body;
 
-  // prevent duplicate payment
-  const exists = await paymentsCollection.findOne({ contestId, email });
-  if (exists) {
-    return res.status(400).json({ message: "Already paid" });
+  if (!contestId || !email || !amount) {
+    return res.status(400).json({ message: "Missing payment data" });
   }
 
+  // ❌ Prevent duplicate payment
+  const exists = await paymentsCollection.findOne({ contestId, email });
+  if (exists) {
+    return res.status(400).json({ message: "Already paid for this contest" });
+  }
+
+  // ✅ Save payment
   await paymentsCollection.insertOne({
     contestId,
     email,
@@ -160,11 +165,13 @@ app.post("/payments", async (req, res) => {
     createdAt: new Date(),
   });
 
+  // ✅ Increase participants
   await contestsCollection.updateOne(
     { _id: new ObjectId(contestId) },
     { $inc: { participants: 1 } }
   );
 
+  // ✅ Register user
   await usersCollection.updateOne(
     { email },
     { $addToSet: { participatedContests: contestId } }
@@ -263,6 +270,16 @@ app.patch("/submissions/winner/:id", async (req, res) => {
   );
 
   res.json({ success: true });
+});
+
+app.get("/users/participated/:email", async (req, res) => {
+  await connectDB();
+
+  const user = await usersCollection.findOne({
+    email: req.params.email,
+  });
+
+  res.json(user?.participatedContests || []);
 });
 
 /* ================= SERVER ================= */
