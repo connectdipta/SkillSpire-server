@@ -1,14 +1,22 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const jwt = require("jsonwebtoken"); // 1. Import JWT
+const cookieParser = require("cookie-parser"); // 2. Import Cookie Parser
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 /* ================= MIDDLEWARE ================= */
-app.use(cors());
+app.use(
+  cors({
+    origin: ["http://localhost:5173"], // Add your client URL
+    credentials: true, // Allow cookies
+  })
+);
 app.use(express.json());
+app.use(cookieParser()); // Enable cookie parsing
 
 /* ================= DB CONNECTION ================= */
 const uri = process.env.MONGODB_URI;
@@ -31,20 +39,72 @@ async function connectDB() {
   if (!db) {
     await client.connect();
     db = client.db("skillspireDB");
-
     contestsCollection = db.collection("contests");
     usersCollection = db.collection("users");
     submissionsCollection = db.collection("submissions");
     paymentsCollection = db.collection("payments");
-
     console.log("✅ MongoDB Connected");
   }
 }
+
+/* ================= CUSTOM MIDDLEWARE ================= */
+
+// 🔒 Verify Token Middleware
+const verifyToken = (req, res, next) => {
+  const token = req.cookies?.token;
+  if (!token) {
+    return res.status(401).send({ message: "Unauthorized access" });
+  }
+  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(401).send({ message: "Unauthorized access" });
+    }
+    req.user = decoded;
+    next();
+  });
+};
+
+// 🛡️ Verify Admin Middleware (Must be used after verifyToken)
+const verifyAdmin = async (req, res, next) => {
+  await connectDB();
+  const email = req.user.email;
+  const user = await usersCollection.findOne({ email });
+  const isAdmin = user?.role === "admin";
+  if (!isAdmin) {
+    return res.status(403).send({ message: "Forbidden access" });
+  }
+  next();
+};
 
 /* ================= HEALTH ================= */
 app.get("/", async (req, res) => {
   await connectDB();
   res.send("SkillSpire API Running");
+});
+
+/* ================= AUTHENTICATION (JWT) ================= */
+
+// 🎟️ Issue Token
+app.post("/jwt", async (req, res) => {
+  const user = req.body;
+  const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, {
+    expiresIn: "1h",
+  });
+
+  res
+    .cookie("token", token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "strict",
+    })
+    .send({ success: true });
+});
+
+// 🚪 Logout (Clear Token)
+app.post("/logout", (req, res) => {
+  res
+    .clearCookie("token", { maxAge: 0, secure: process.env.NODE_ENV === "production", sameSite: process.env.NODE_ENV === "production" ? "none" : "strict" })
+    .send({ success: true });
 });
 
 /* =====================================================
@@ -55,18 +115,10 @@ app.get("/contests", async (req, res) => {
   await connectDB();
   const { search, sort, limit, creatorEmail, status } = req.query;
 
-  // ONLY APPROVED CONTESTS
-  let query = { status: "confirmed" }; 
+  let query = { status: "confirmed" };
 
-  // Creator dashboard override
-  if (creatorEmail) {
-    query = { creatorEmail }; // creators see their own contests
-  }
-
-  // Admin override
-  if (status) {
-    query = { status }; // admin can filter pending / rejected
-  }
+  if (creatorEmail) query = { creatorEmail };
+  if (status) query = { status };
 
   if (search) {
     query.$or = [
@@ -76,15 +128,13 @@ app.get("/contests", async (req, res) => {
   }
 
   let cursor = contestsCollection.find(query);
-
   if (sort === "participants") cursor = cursor.sort({ participants: -1 });
   if (limit) cursor = cursor.limit(Number(limit));
 
   res.json(await cursor.toArray());
 });
 
-
-app.get("/contests/:id", async (req, res) => {
+app.get("/contests/:id", verifyToken, async (req, res) => { // 🔒 Secured
   await connectDB();
   const contest = await contestsCollection.findOne({
     _id: new ObjectId(req.params.id),
@@ -93,23 +143,20 @@ app.get("/contests/:id", async (req, res) => {
   res.json(contest);
 });
 
-app.post("/contests", async (req, res) => {
+app.post("/contests", verifyToken, async (req, res) => { // 🔒 Secured
   await connectDB();
-
   const contest = {
     ...req.body,
     participants: 0,
     status: "pending",
     createdAt: new Date(),
   };
-
   const result = await contestsCollection.insertOne(contest);
   res.json(result);
 });
 
-app.put("/contests/:id", async (req, res) => {
+app.put("/contests/:id", verifyToken, async (req, res) => { // 🔒 Secured
   await connectDB();
-
   const contest = await contestsCollection.findOne({
     _id: new ObjectId(req.params.id),
   });
@@ -122,11 +169,10 @@ app.put("/contests/:id", async (req, res) => {
     { _id: new ObjectId(req.params.id) },
     { $set: req.body }
   );
-
   res.json(result);
 });
 
-app.patch("/contests/status/:id", async (req, res) => {
+app.patch("/contests/status/:id", verifyToken, verifyAdmin, async (req, res) => { // 🛡️ Admin Only
   await connectDB();
   const result = await contestsCollection.updateOne(
     { _id: new ObjectId(req.params.id) },
@@ -135,7 +181,7 @@ app.patch("/contests/status/:id", async (req, res) => {
   res.json(result);
 });
 
-app.delete("/contests/:id", async (req, res) => {
+app.delete("/contests/:id", verifyToken, verifyAdmin, async (req, res) => { // 🛡️ Admin Only
   await connectDB();
   res.json(
     await contestsCollection.deleteOne({ _id: new ObjectId(req.params.id) })
@@ -146,28 +192,19 @@ app.delete("/contests/:id", async (req, res) => {
    ===================== PAYMENTS ======================
    ===================================================== */
 
-/**
- * After successful payment:
- * 1. Save payment
- * 2. Increase participants
- * 3. Register user to contest
- */
-app.post("/payments", async (req, res) => {
+app.post("/payments", verifyToken, async (req, res) => { // 🔒 Secured
   await connectDB();
-
   const { contestId, email, amount } = req.body;
 
   if (!contestId || !email || !amount) {
     return res.status(400).json({ message: "Missing payment data" });
   }
 
-  // Prevent duplicate payment
   const exists = await paymentsCollection.findOne({ contestId, email });
   if (exists) {
     return res.status(400).json({ message: "Already paid for this contest" });
   }
 
-  // Save payment
   await paymentsCollection.insertOne({
     contestId,
     email,
@@ -175,13 +212,11 @@ app.post("/payments", async (req, res) => {
     createdAt: new Date(),
   });
 
-  // ncrease participants
   await contestsCollection.updateOne(
     { _id: new ObjectId(contestId) },
     { $inc: { participants: 1 } }
   );
 
-  // Register user
   await usersCollection.updateOne(
     { email },
     { $addToSet: { participatedContests: contestId } }
@@ -196,7 +231,6 @@ app.post("/payments", async (req, res) => {
 
 app.post("/users", async (req, res) => {
   await connectDB();
-
   const user = req.body;
   const exists = await usersCollection.findOne({ email: user.email });
   if (exists) return res.json({ message: "User exists" });
@@ -205,22 +239,24 @@ app.post("/users", async (req, res) => {
   user.createdAt = new Date();
   user.participatedContests = [];
   user.wonContests = [];
-
   res.json(await usersCollection.insertOne(user));
 });
 
-app.get("/users", async (req, res) => {
+app.get("/users", verifyToken, verifyAdmin, async (req, res) => { // 🛡️ Admin Only
   await connectDB();
   res.json(await usersCollection.find().toArray());
 });
 
-app.get("/users/role/:email", async (req, res) => {
+app.get("/users/role/:email", verifyToken, async (req, res) => { // 🔒 Secured
   await connectDB();
+  if (req.params.email !== req.user.email) {
+    return res.status(403).send({ message: "Forbidden access" });
+  }
   const user = await usersCollection.findOne({ email: req.params.email });
   res.json({ role: user?.role || "user" });
 });
 
-app.patch("/users/role/:email", async (req, res) => {
+app.patch("/users/role/:email", verifyToken, verifyAdmin, async (req, res) => { // 🛡️ Admin Only
   await connectDB();
   res.json(
     await usersCollection.updateOne(
@@ -230,33 +266,21 @@ app.patch("/users/role/:email", async (req, res) => {
   );
 });
 
-/* ================= UPDATE USER PROFILE ================= */
-app.patch("/users/profile/:email", async (req, res) => {
+app.patch("/users/profile/:email", verifyToken, async (req, res) => { // 🔒 Secured
   await connectDB();
-
   const { name, photo, bio } = req.body;
-
   const result = await usersCollection.updateOne(
     { email: req.params.email },
-    {
-      $set: {
-        name,
-        photo,
-        bio,
-        updatedAt: new Date(),
-      },
-    }
+    { $set: { name, photo, bio, updatedAt: new Date() } }
   );
-
   res.json(result);
 });
-
 
 /* =====================================================
    =================== SUBMISSIONS =====================
    ===================================================== */
 
-app.post("/submissions", async (req, res) => {
+app.post("/submissions", verifyToken, async (req, res) => { // 🔒 Secured
   await connectDB();
   const submission = {
     ...req.body,
@@ -266,7 +290,7 @@ app.post("/submissions", async (req, res) => {
   res.json(await submissionsCollection.insertOne(submission));
 });
 
-app.get("/submissions/:contestId", async (req, res) => {
+app.get("/submissions/:contestId", verifyToken, async (req, res) => { // 🔒 Secured
   await connectDB();
   res.json(
     await submissionsCollection
@@ -275,9 +299,8 @@ app.get("/submissions/:contestId", async (req, res) => {
   );
 });
 
-app.patch("/submissions/winner/:id", async (req, res) => {
+app.patch("/submissions/winner/:id", verifyToken, async (req, res) => { // 🔒 Secured (Ideally Admin/Creator)
   await connectDB();
-
   const submission = await submissionsCollection.findOne({
     _id: new ObjectId(req.params.id),
   });
@@ -304,23 +327,15 @@ app.patch("/submissions/winner/:id", async (req, res) => {
   res.json({ success: true });
 });
 
-app.get("/users/participated/:email", async (req, res) => {
+app.get("/users/participated/:email", verifyToken, async (req, res) => { // 🔒 Secured
   await connectDB();
-
-  const user = await usersCollection.findOne({
-    email: req.params.email,
-  });
-
+  const user = await usersCollection.findOne({ email: req.params.email });
   res.json(user?.participatedContests || []);
 });
 
-app.get("/users/won/:email", async (req, res) => {
+app.get("/users/won/:email", verifyToken, async (req, res) => { // 🔒 Secured
   await connectDB();
-
-  const user = await usersCollection.findOne({
-    email: req.params.email,
-  });
-
+  const user = await usersCollection.findOne({ email: req.params.email });
   res.json(user?.wonContests || []);
 });
 
@@ -330,7 +345,6 @@ app.get("/users/won/:email", async (req, res) => {
 
 app.get("/winners", async (req, res) => {
   await connectDB();
-
   const winners = await submissionsCollection
     .find({ isWinner: true })
     .sort({ submittedAt: -1 })
@@ -338,13 +352,11 @@ app.get("/winners", async (req, res) => {
     .toArray();
 
   const result = [];
-
   for (const win of winners) {
     const user = await usersCollection.findOne({ email: win.userEmail });
     const contest = await contestsCollection.findOne({
       _id: new ObjectId(win.contestId),
     });
-
     if (user && contest) {
       result.push({
         name: user.name || user.displayName || "Winner",
@@ -354,7 +366,6 @@ app.get("/winners", async (req, res) => {
       });
     }
   }
-
   res.json(result);
 });
 
@@ -364,19 +375,13 @@ app.get("/winners", async (req, res) => {
 
 app.get("/leaderboard", async (req, res) => {
   await connectDB();
-
   const users = await usersCollection
     .find({ wonContests: { $exists: true, $ne: [] } })
-    .project({
-      name: 1,
-      photo: 1,
-      email: 1,
-      wonContests: 1,
-    })
+    .project({ name: 1, photo: 1, email: 1, wonContests: 1 })
     .toArray();
 
   const leaderboard = users
-    .map(user => ({
+    .map((user) => ({
       name: user.name || "Anonymous",
       photo: user.photo || "",
       email: user.email,
@@ -386,7 +391,6 @@ app.get("/leaderboard", async (req, res) => {
 
   res.json(leaderboard);
 });
-
 
 /* ================= SERVER ================= */
 app.listen(port, () =>
