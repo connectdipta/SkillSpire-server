@@ -54,7 +54,19 @@ app.get("/", async (req, res) => {
 app.get("/contests", async (req, res) => {
   await connectDB();
   const { search, sort, limit, creatorEmail, status } = req.query;
-  let query = {};
+
+  // ONLY APPROVED CONTESTS
+  let query = { status: "confirmed" }; 
+
+  // Creator dashboard override
+  if (creatorEmail) {
+    query = { creatorEmail }; // creators see their own contests
+  }
+
+  // Admin override
+  if (status) {
+    query = { status }; // admin can filter pending / rejected
+  }
 
   if (search) {
     query.$or = [
@@ -63,9 +75,6 @@ app.get("/contests", async (req, res) => {
     ];
   }
 
-  if (creatorEmail) query.creatorEmail = creatorEmail;
-  if (status) query.status = status;
-
   let cursor = contestsCollection.find(query);
 
   if (sort === "participants") cursor = cursor.sort({ participants: -1 });
@@ -73,6 +82,7 @@ app.get("/contests", async (req, res) => {
 
   res.json(await cursor.toArray());
 });
+
 
 app.get("/contests/:id", async (req, res) => {
   await connectDB();
@@ -151,13 +161,13 @@ app.post("/payments", async (req, res) => {
     return res.status(400).json({ message: "Missing payment data" });
   }
 
-  // ❌ Prevent duplicate payment
+  // Prevent duplicate payment
   const exists = await paymentsCollection.findOne({ contestId, email });
   if (exists) {
     return res.status(400).json({ message: "Already paid for this contest" });
   }
 
-  // ✅ Save payment
+  // Save payment
   await paymentsCollection.insertOne({
     contestId,
     email,
@@ -165,13 +175,13 @@ app.post("/payments", async (req, res) => {
     createdAt: new Date(),
   });
 
-  // ✅ Increase participants
+  // ncrease participants
   await contestsCollection.updateOne(
     { _id: new ObjectId(contestId) },
     { $inc: { participants: 1 } }
   );
 
-  // ✅ Register user
+  // Register user
   await usersCollection.updateOne(
     { email },
     { $addToSet: { participatedContests: contestId } }
@@ -219,6 +229,28 @@ app.patch("/users/role/:email", async (req, res) => {
     )
   );
 });
+
+/* ================= UPDATE USER PROFILE ================= */
+app.patch("/users/profile/:email", async (req, res) => {
+  await connectDB();
+
+  const { name, photo, bio } = req.body;
+
+  const result = await usersCollection.updateOne(
+    { email: req.params.email },
+    {
+      $set: {
+        name,
+        photo,
+        bio,
+        updatedAt: new Date(),
+      },
+    }
+  );
+
+  res.json(result);
+});
+
 
 /* =====================================================
    =================== SUBMISSIONS =====================
@@ -281,6 +313,80 @@ app.get("/users/participated/:email", async (req, res) => {
 
   res.json(user?.participatedContests || []);
 });
+
+app.get("/users/won/:email", async (req, res) => {
+  await connectDB();
+
+  const user = await usersCollection.findOne({
+    email: req.params.email,
+  });
+
+  res.json(user?.wonContests || []);
+});
+
+/* =====================================================
+   =================== WINNERS API =====================
+   ===================================================== */
+
+app.get("/winners", async (req, res) => {
+  await connectDB();
+
+  const winners = await submissionsCollection
+    .find({ isWinner: true })
+    .sort({ submittedAt: -1 })
+    .limit(6)
+    .toArray();
+
+  const result = [];
+
+  for (const win of winners) {
+    const user = await usersCollection.findOne({ email: win.userEmail });
+    const contest = await contestsCollection.findOne({
+      _id: new ObjectId(win.contestId),
+    });
+
+    if (user && contest) {
+      result.push({
+        name: user.name || user.displayName || "Winner",
+        photo: user.photo || user.photoURL || "",
+        contest: contest.name,
+        prize: contest.prize,
+      });
+    }
+  }
+
+  res.json(result);
+});
+
+/* =====================================================
+   =================== LEADERBOARD =====================
+   ===================================================== */
+
+app.get("/leaderboard", async (req, res) => {
+  await connectDB();
+
+  const users = await usersCollection
+    .find({ wonContests: { $exists: true, $ne: [] } })
+    .project({
+      name: 1,
+      photo: 1,
+      email: 1,
+      wonContests: 1,
+    })
+    .toArray();
+
+  const leaderboard = users
+    .map(user => ({
+      name: user.name || "Anonymous",
+      photo: user.photo || "",
+      email: user.email,
+      wins: user.wonContests.length,
+    }))
+    .sort((a, b) => b.wins - a.wins);
+
+  res.json(leaderboard);
+});
+
 
 /* ================= SERVER ================= */
 app.listen(port, () =>
