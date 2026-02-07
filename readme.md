@@ -6,8 +6,8 @@ It enables users to create, participate in, and judge contests with a secure, ro
 ---
 
 ## 🌐 Live Links
-- **Server URL:** `http://localhost:3000` *(Replace with your deployed Vercel/Render URL)*
-- **Frontend Repository:** _[Insert Link Here]_
+- **Server URL:** `https://skill-spire-server.vercel.app/`
+- **Frontend Repository:** _[https://github.com/connectdipta/SkillSpire-client]_
 
 ---
 
